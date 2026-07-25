@@ -611,14 +611,37 @@ def _pypdf_extract_text(pdf_bytes):
 
 _MONEY_PATTERN = r"\$?\s?([\d]{1,3}(?:,\d{3})*(?:\.\d{2})?)"
 
-DEDUCTIBLE_INDIVIDUAL_RE = re.compile(
-    r"(?:deductible applied to date|in-network deductible)[^\d$\n]{0,40}" + _MONEY_PATTERN,
-    re.IGNORECASE,
+DEDUCTIBLE_INDIVIDUAL_LABELS = (
+    r"in.?network\s+deductible\s+applied\s+to\s+date",
+    r"individual\s+deductible",
+    r"deductible\s+applied",
 )
-OOP_MET_YTD_RE = re.compile(
-    r"out-of-pocket maximum applied to date[^\d$\n]{0,40}" + _MONEY_PATTERN,
-    re.IGNORECASE,
+
+OOP_MET_YTD_LABELS = (
+    r"in.?network\s+out.?of.?pocket\s+maximum\s+applied\s+to\s+date",
+    r"out.?of.?pocket\s+maximum\s+applied",
+    r"oop\s+met",
 )
+
+
+def _dollar_match_near_label(text, label_patterns):
+    # type: (str, Any) -> Optional[Any]
+    """Find a dollar amount within ~100 characters after a label.
+
+    EOB PDFs often split a label and its dollar amount across lines, so this
+    deliberately allows whitespace and nearby content between them. Returning
+    the match keeps the source snippet available for the review screen.
+    """
+    for pattern in label_patterns:
+        match = re.search(
+            pattern + r"[\s\S]{0,100}?\$?\s*([\d,]+\.\d{2})",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return match
+    return None
+
 PROVIDER_NAME_RE = re.compile(
     r"provider name:\s*([A-Za-z][A-Za-z.,'\- ]{1,60})",
     re.IGNORECASE,
@@ -660,7 +683,7 @@ def _regex_extract_fields(text):
     """
     out = {}  # type: Dict[str, Dict[str, Any]]
 
-    m = DEDUCTIBLE_INDIVIDUAL_RE.search(text)
+    m = _dollar_match_near_label(text, DEDUCTIBLE_INDIVIDUAL_LABELS)
     if m:
         out["deductible_individual"] = {
             "value": float(m.group(1).replace(",", "")),
@@ -668,7 +691,7 @@ def _regex_extract_fields(text):
             "source_snippet": _line_for_match(text, m),
         }
 
-    m = OOP_MET_YTD_RE.search(text)
+    m = _dollar_match_near_label(text, OOP_MET_YTD_LABELS)
     if m:
         out["oop_met_ytd"] = {
             "value": float(m.group(1).replace(",", "")),
