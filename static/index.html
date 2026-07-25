@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FAF7F2">
+<title>Your plan, in plain language</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: {
+      bg: '#FAF7F2',
+      primary: '#0F6B5C',
+      accent: '#E8A33D',
+      ink: '#1A2420',
+      card: '#DCE5DE',
+      muted: '#5B7268',
+    },
+    fontFamily: { sans: [
+      'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'
+    ] },
+  } } };
+</script>
+<style>
+  .safe-bottom { padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
+  /* 16px minimum stops iOS Safari from zooming on focus. */
+  input, select, textarea { font-size: 16px; }
+
+  /* Screen transition: 200ms, direction-aware. */
+  #card { transition: opacity 200ms ease, transform 200ms ease; }
+  #card.leaving-fwd  { opacity: 0; transform: translateX(-12px); }
+  #card.leaving-back { opacity: 0; transform: translateX(12px); }
+  #card.entering-fwd  { opacity: 0; transform: translateX(12px); }
+  #card.entering-back { opacity: 0; transform: translateX(-12px); }
+
+  @media (prefers-reduced-motion: reduce) {
+    #card, #panel, #panel-scrim { transition-duration: 1ms !important; }
+    .tick { animation: none !important; }
+  }
+
+  @keyframes tick { 0% { opacity: .35; transform: translateY(3px); } 100% { opacity: 1; transform: translateY(0); } }
+  .tick { animation: tick 260ms ease-out; }
+</style>
+</head>
+<body class="h-full bg-bg text-ink font-sans antialiased">
+
+<div class="mx-auto flex min-h-full max-w-lg flex-col">
+
+  <header class="sticky top-0 z-10 bg-bg/95 px-4 pt-4 pb-2 backdrop-blur">
+    <div class="flex items-baseline justify-between gap-4 text-sm">
+      <span id="stage-label" class="truncate font-semibold text-ink/80"></span>
+      <div class="flex shrink-0 items-center gap-2">
+        <span id="step-counter" class="tabular-nums text-ink/40"></span>
+        <button id="panel-open" type="button"
+          class="hidden rounded-full bg-white px-4 py-2 text-xs font-medium text-ink/70 ring-1 ring-card active:bg-bg">
+          What we know
+        </button>
+      </div>
+    </div>
+    <!-- Four dots, not a percentage: the flow is four screens now. -->
+    <div id="dots" class="mt-2 flex gap-2" role="progressbar" aria-valuemin="1" aria-valuemax="4"></div>
+  </header>
+
+  <main id="card" class="flex-1 px-4 pt-6"></main>
+
+  <footer id="footer" class="safe-bottom sticky bottom-0 bg-bg/95 px-4 pt-4 backdrop-blur">
+    <div id="save-state" class="mb-2 h-4 text-center text-xs text-ink/35"></div>
+    <div id="footer-actions" class="space-y-4"></div>
+  </footer>
+</div>
+
+<div id="panel-scrim" class="pointer-events-none fixed inset-0 z-20 bg-ink/30 opacity-0 transition-opacity duration-200"></div>
+<aside id="panel" role="dialog" aria-label="What we know so far"
+  class="fixed inset-y-0 right-0 z-30 w-[85%] max-w-sm translate-x-full overflow-y-auto bg-bg shadow-2xl transition-transform duration-200 ease-out">
+  <div class="safe-bottom flex min-h-full flex-col p-6">
+    <div class="flex items-start justify-between">
+      <h2 class="text-xl font-bold text-ink">What we know so far</h2>
+      <button id="panel-close" type="button" aria-label="Close"
+        class="-mr-2 -mt-2 flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none text-ink/40 active:bg-card/40">&times;</button>
+    </div>
+    <div id="panel-body" class="mt-4 flex-1"></div>
+  </div>
+</aside>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+const money = (n) => '$' + Math.round(n).toLocaleString('en-US');
+
+let SCHEMA = null;
+const FIELDS = {};          // name -> {stage, field}
+const answers = {};         // name -> working field object
+let SCREENS = [];
+let screen = 1;
+let openRow = null;         // name of the row currently expanded for editing
+let comboHi = -1;
+// null = no upload attempted this session (manual entry, or a returning
+// session); 'partial' = the upload found at least one field; 'none' = an
+// upload was attempted but nothing came back. Drives the Screen 2 note.
+let extractionOutcome = null;
+
+/* ---------- shared style tokens ---------- */
+// Border-radius: 12px (rounded-xl) on cards/inputs, 8px (rounded-lg) on buttons.
+// Spacing: 8 / 16 / 24 / 32 / 48px only (Tailwind 2 / 4 / 6 / 8 / 12), except
+// fixed touch-target heights (min-h) and decorative pill/badge padding, which
+// are dimensions and micro-components rather than layout spacing.
+const BTN_PRIMARY = 'min-h-[56px] w-full rounded-lg bg-primary px-4 text-base font-semibold text-white active:bg-primary/90 disabled:opacity-40';
+const BTN_SECOND = 'min-h-[56px] w-full rounded-lg border border-card bg-white px-4 text-base font-medium text-ink active:bg-bg disabled:opacity-40';
+const LINK_CLS = 'text-sm font-medium text-muted underline underline-offset-4 active:text-ink';
+const LABEL_CLS = 'text-[13px] font-semibold uppercase tracking-[0.05em] text-ink/45';
+const INPUT_CLS = 'w-full min-h-[56px] rounded-xl border border-card bg-white px-4 text-base text-ink ' +
+  'placeholder:text-ink/35 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/15';
+const CHOICE_CLS = 'flex w-full min-h-[56px] items-center rounded-xl border px-4 text-left text-base';
+
+const BADGES = {
+  document: ['from your document', 'bg-primary/10 text-primary'],
+  member: ['you told us', 'bg-card/60 text-ink/70'],
+  assumed: ['estimated, tap to correct', 'bg-white text-primary/70 ring-1 ring-primary/25'],
+};
+
+/* ---------- data ---------- */
+
+async function boot() {
+  SCHEMA = await (await fetch('/api/schema')).json();
+  let sessionId = new URLSearchParams(location.search).get('session') || localStorage.getItem('session_id');
+  if (sessionId) {
+    const res = await fetch('/api/session/' + encodeURIComponent(sessionId));
+    if (res.ok) { SCHEMA = await res.json(); window.sessionId = sessionId; }
+    else localStorage.removeItem('session_id');
+  }
+  SCREENS = SCHEMA.screens;
+  for (const stage of SCHEMA.stages) {
+    for (const [name, field] of Object.entries(stage.fields)) {
+      FIELDS[name] = { stage, field };
+      answers[name] = field;
+    }
+  }
+  // A returning session skips the upload prompt.
+  screen = Object.values(answers).some((f) => f.source !== 'empty') ? 2 : 1;
+  if (screen === 2) applyDefaults();
+  render();
+}
+
+let saveTimer = null;
+const pending = {};
+function save(name, field, immediate) {
+  answers[name] = field;
+  pending[name] = {
+    value: field.value, source: field.source, confidence: field.confidence,
+    confirmed: field.confirmed, skipped: !!field.skipped,
+  };
+  refreshPanel();
+  clearTimeout(saveTimer);
+  immediate ? flush() : (saveTimer = setTimeout(flush, 600));
+}
+
+async function flush() {
+  const fields = Object.assign({}, pending);
+  if (!Object.keys(fields).length) return;
+  Object.keys(pending).forEach((k) => delete pending[k]);
+  $('save-state').textContent = 'Saving…';
+  try {
+    const res = await fetch('/api/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: window.sessionId,
+        fields,
+        progress: { screen: currentScreen().key },
+      }),
+    });
+    if (!res.ok) throw new Error(res.status);
+    const body = await res.json();
+    window.sessionId = body.session_id;
+    localStorage.setItem('session_id', body.session_id);
+    $('save-state').textContent = 'Saved';
+  } catch (err) {
+    Object.assign(pending, fields);   // keep it queued for the next write
+    $('save-state').textContent = "Couldn't save — we'll retry";
+  }
+}
+
+/* A member-typed value is trusted fully but still unconfirmed -- confirmation
+   is a separate, explicit step on screen 4, not a side effect of typing. */
+const answered = (name, value) => Object.assign({}, answers[name], {
+  value, source: 'member', confidence: 1.0, confirmed: false, skipped: false,
+});
+
+/* Anything still empty when the member lands on screen 2 gets our best
+   stand-in, tagged assumed so it reads as a guess and not as their answer. */
+function applyDefaults() {
+  const tier = answers.metal_tier && answers.metal_tier.value;
+  const sd = SCHEMA.smart_defaults;
+  for (const name of currentFieldNames(2)) {
+    const f = answers[name];
+    if (f.source !== 'empty' || sd.never_guessed.indexOf(name) !== -1) continue;
+
+    let value;
+    if (name === 'monthly_premium') {
+      value = (tier && sd.premium_by_metal_tier[tier]) != null
+        ? sd.premium_by_metal_tier[tier] : sd.premium_fallback;
+    } else if (Object.prototype.hasOwnProperty.call(sd.flat, name)) {
+      value = sd.flat[name];
+    } else if (Object.prototype.hasOwnProperty.call(FIELDS[name].field, 'assumed_default')) {
+      value = FIELDS[name].field.assumed_default;
+    } else continue;
+
+    save(name, Object.assign({}, f, {
+      value, source: 'assumed', confidence: 0.3, confirmed: false, skipped: false,
+    }));
+  }
+  // Fields nobody is asked outright still get their stand-in, so the summary
+  // isn't full of blanks the member never had a chance to fill.
+  for (const name of SCHEMA.unprompted_fields || []) {
+    const f = answers[name];
+    const d = FIELDS[name].field;
+    if (f.source === 'empty' && Object.prototype.hasOwnProperty.call(d, 'assumed_default')) {
+      save(name, Object.assign({}, f, {
+        value: d.assumed_default, source: 'assumed', confidence: 0.3,
+        confirmed: false, skipped: false,
+      }));
+    }
+  }
+}
+
+const currentScreen = () => SCREENS.find((s) => s.number === screen) || SCREENS[0];
+const currentFieldNames = (n) => (SCREENS.find((s) => s.number === n) || {}).fields || [];
+
+/* ---------- chrome ---------- */
+
+function chrome() {
+  const sc = currentScreen();
+  $('stage-label').textContent = sc.title.replace(/\.$/, '');
+  $('step-counter').textContent = `Step ${screen} of 4`;
+  $('dots').setAttribute('aria-valuenow', screen);
+  $('dots').innerHTML = SCREENS.map((s) => `
+    <span class="h-1.5 flex-1 rounded-full ${s.number <= screen ? 'bg-primary' : 'bg-card'}"></span>
+  `).join('');
+  $('panel-open').classList.toggle('hidden', screen < 2);
+}
+
+function goto(n, dir) {
+  const card = $('card');
+  const direction = dir || (n > screen ? 'fwd' : 'back');
+  card.classList.add(direction === 'back' ? 'leaving-back' : 'leaving-fwd');
+  setTimeout(() => {
+    card.classList.remove('leaving-back', 'leaving-fwd');
+    screen = n;
+    openRow = null;
+    if (n === 2) applyDefaults();
+    render();
+    card.classList.add(direction === 'back' ? 'entering-back' : 'entering-fwd');
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      card.classList.remove('entering-back', 'entering-fwd');
+    }));
+  }, 200);
+}
+
+function render() {
+  chrome();
+  if (screen === 1) renderUpload();
+  else if (screen === 2) renderList(2);
+  else if (screen === 3) renderList(3);
+  else renderConfirm();
+  refreshPanel();
+  window.scrollTo({ top: 0 });
+}
+
+/* ---------- screen 1: upload ---------- */
+
+function renderUpload() {
+  $('card').innerHTML = `
+    <h1 class="text-[28px] font-bold leading-tight tracking-tight text-ink">
+      Let's start with what you already have.
+    </h1>
+    <p class="mt-4 text-base leading-relaxed text-ink/70">
+      A photo of your insurance card, your Summary of Benefits, or any
+      Explanation of Benefits. We'll read what we can and you correct the rest —
+      it's faster than typing it all out.
+    </p>
+    <div class="mt-6 rounded-xl border-2 border-dashed border-card bg-white p-8 text-center">
+      <div class="text-4xl" aria-hidden="true">🪪</div>
+      <p class="mt-2 text-sm text-muted">Card, SBC, or EOB — photo or PDF</p>
+    </div>
+    <p class="mt-6 text-xs leading-relaxed text-ink/35">
+      We use it to read your plan's numbers and nothing else.
+    </p>
+    <input id="file" type="file" class="hidden" multiple
+      accept="image/*,application/pdf">`;
+
+  $('footer-actions').innerHTML = `
+    <button id="pick" type="button" class="${BTN_PRIMARY}">Upload your card, SBC, or EOB</button>
+    <button id="manual" type="button" class="w-full py-2 text-center ${LINK_CLS}">
+      Enter details myself instead
+    </button>`;
+
+  $('pick').addEventListener('click', () => $('file').click());
+  $('file').addEventListener('change', upload);
+  // Skips extraction entirely and lands on screen 2 with nothing filled in.
+  $('manual').addEventListener('click', () => { extractionOutcome = null; goto(2); });
+}
+
+/* No result banner here by design -- whatever happened (some fields found,
+   none found, or the request never came back at all) is communicated on
+   Screen 2 instead, once the defaulted fields are already on screen. A
+   network failure reads exactly the same as a clean empty extraction: this
+   is never surfaced as an error, just fewer fields to correct. */
+async function upload() {
+  const files = Array.from($('file').files || []);
+  if (!files.length) return;
+
+  const btn = $('pick');
+  btn.disabled = true;
+  btn.textContent = 'Reading…';
+
+  const form = new FormData();
+  files.forEach((f, i) => form.append('file_' + i, f));
+  if (window.sessionId) form.append('session_id', window.sessionId);
+
+  let result;
+  try {
+    const res = await fetch('/api/extract', { method: 'POST', body: form });
+    if (!res.ok) throw new Error(res.status);
+    result = await res.json();
+  } catch (err) {
+    result = { fields: {} };
+  }
+
+  // Extracted values arrive as source="document" -- they land on screen 2
+  // pre-filled and flagged for a double-check.
+  const extracted = Object.entries(result.fields || {});
+  for (const [name, incoming] of extracted) {
+    if (!FIELDS[name]) continue;
+    save(name, Object.assign({}, answers[name], {
+      value: incoming.value,
+      source: 'document',
+      confidence: incoming.confidence != null ? incoming.confidence : 0.7,
+      confirmed: false,
+      skipped: false,
+    }));
+  }
+
+  extractionOutcome = extracted.length ? 'partial' : 'none';
+  btn.disabled = false;
+  btn.textContent = 'Upload your card, SBC, or EOB';
+  goto(2);
+}
+
+/* ---------- screens 2 & 3: one editable list ---------- */
+
+/* Screen 2 only. Calm, specific wording instead of an error state -- by the
+   time this renders, applyDefaults() has already filled every field with a
+   typical value, so the screen never looks empty regardless of which case
+   this is. No red, no icons, no "failed"/"error"/"nothing". */
+function extractionNoteHtml(n) {
+  if (n !== 2 || !extractionOutcome) return '';
+  if (extractionOutcome === 'partial') {
+    return `
+      <p class="mt-4 text-sm leading-relaxed text-muted">
+        We pulled what we could from your file. Everything else is estimated, tap any value to correct it.
+      </p>`;
+  }
+  return `
+    <div class="mt-4">
+      <p class="text-sm leading-relaxed text-muted">
+        We couldn't read that file, so we've started you with typical values. Correct anything that looks off, it takes about a minute.
+      </p>
+      <button type="button" id="try-different-file" class="mt-2 ${LINK_CLS}">Try a different file</button>
+    </div>`;
+}
+
+function renderList(n) {
+  const sc = SCREENS.find((s) => s.number === n);
+  const names = sc.fields;
+
+  $('card').innerHTML = `
+    <h1 class="text-[28px] font-bold leading-tight tracking-tight text-ink">${esc(sc.title)}</h1>
+    <p class="mt-4 text-base leading-relaxed text-ink/70">${esc(sc.intro)}</p>
+    ${extractionNoteHtml(n)}
+    <div id="list" class="mt-6 space-y-2"></div>`;
+
+  $('footer-actions').innerHTML = `
+    <button id="fwd" type="button" class="${BTN_PRIMARY}">
+      ${n === 2 ? 'These look right' : 'Review everything'}
+    </button>
+    <button id="bk" type="button" class="w-full py-2 text-center ${LINK_CLS}">
+      Back
+    </button>`;
+  $('fwd').addEventListener('click', () => { flush(); goto(n + 1); });
+  $('bk').addEventListener('click', () => goto(n - 1));
+
+  const tryAgain = $('try-different-file');
+  if (tryAgain) tryAgain.addEventListener('click', () => { extractionOutcome = null; goto(1); });
+
+  drawList(names);
+}
+
+function drawList(names) {
+  const list = $('list');
+  list.innerHTML = names.map((name) => `<div data-row="${esc(name)}"></div>`).join('');
+  names.forEach((name) => drawRow(name, names));
+}
+
+function drawRow(name, names) {
+  const host = $('card').querySelector(`[data-row="${name}"]`);
+  const { field } = FIELDS[name];
+  const f = answers[name];
+  // `field` is FIELDS[name].field -- the static schema metadata, frozen at
+  // boot. `f` (answers[name]) is the live value; save() always reassigns
+  // answers[name] to a *new* object, so `field` never picks up an edit.
+  // Feed the input the metadata plus the live value/source, or a reopened
+  // row shows whatever was there before the first save, not the current one.
+  const liveField = Object.assign({}, field, { value: f.value, source: f.source });
+  const editing = openRow === name;
+  const [badgeText, badgeCls] = BADGES[f.source] || ['not answered', 'bg-card/40 text-ink/45'];
+  const skippable = field.sensitivity === 'high' || field.optional;
+
+  if (!editing) {
+    host.innerHTML = `
+      <button type="button" data-open="${esc(name)}"
+        class="w-full rounded-xl bg-white p-4 text-left ring-1 ${f.source === 'assumed' ? 'ring-primary/25' : 'ring-card'} active:bg-bg">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0 flex-1">
+            <div class="text-xs text-ink/45">${esc(field.label)}</div>
+            <div class="mt-1 break-words text-base leading-snug ${f.value == null ? '' : 'text-ink'}">${displayValue(name)}</div>
+            <div class="mt-2">
+              <span class="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}">${esc(badgeText)}</span>
+            </div>
+          </div>
+          <span class="shrink-0 pt-4 text-sm font-medium text-muted" aria-hidden="true">Edit</span>
+        </div>
+      </button>`;
+    host.querySelector('[data-open]').addEventListener('click', () => {
+      openRow = name;
+      drawList(names);
+      const el = $('card').querySelector(`[data-row="${name}"]`);
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    return;
+  }
+
+  host.innerHTML = `
+    <div class="rounded-xl bg-white p-4 ring-2 ring-primary">
+      <div class="text-sm font-semibold text-ink">${esc(field.label)}</div>
+      ${field.sensitivity === 'high' ? `
+        <p class="mt-2 rounded-xl bg-accent/10 p-4 text-sm leading-relaxed text-ink/80 ring-1 ring-accent/25">
+          <span class="font-semibold text-ink">Why we ask: </span>${esc(field.why_we_ask)}
+        </p>` : ''}
+      <div class="mt-4" data-input>${inputFor(name, liveField)}</div>
+      ${field.find_it ? `
+        <p class="mt-2 flex gap-2 text-sm leading-relaxed text-muted">
+          <span aria-hidden="true">↳</span><span>${esc(field.find_it)}</span>
+        </p>` : ''}
+      ${field.sensitivity !== 'high' ? `
+        <details class="mt-2 text-sm text-muted">
+          <summary class="cursor-pointer py-1 underline underline-offset-4">Why we ask</summary>
+          <p class="pt-1 leading-relaxed">${esc(field.why_we_ask)}</p>
+        </details>` : ''}
+      <div class="mt-4 flex items-center gap-4">
+        <button type="button" data-done class="min-h-[44px] rounded-lg bg-primary px-5 text-sm font-semibold text-white active:bg-primary/90">Done</button>
+        <button type="button" data-notsure class="${LINK_CLS}">Not sure</button>
+        ${skippable ? `<button type="button" data-skip class="${LINK_CLS}">Skip</button>` : ''}
+      </div>
+    </div>`;
+
+  const scope = host;
+  wire(name, liveField, scope, names);
+
+  const close = () => { openRow = null; drawList(names); };
+
+  host.querySelector('[data-done]').addEventListener('click', () => {
+    save(name, answered(name, readValue(field, scope)), true);
+    close();
+  });
+
+  /* "Not sure" fills our best stand-in and closes the row. Confidence stays
+     low so nothing downstream treats it as fact. */
+  host.querySelector('[data-notsure]').addEventListener('click', () => {
+    const d = FIELDS[name].field;
+    const has = Object.prototype.hasOwnProperty.call(d, 'assumed_default');
+    const tierValue = name === 'monthly_premium'
+      ? (SCHEMA.smart_defaults.premium_by_metal_tier[answers.metal_tier.value] ||
+         SCHEMA.smart_defaults.premium_fallback)
+      : undefined;
+    save(name, Object.assign({}, answers[name], {
+      value: tierValue !== undefined ? tierValue : (has ? d.assumed_default : null),
+      source: 'assumed',
+      confidence: (tierValue !== undefined || has) ? 0.3 : 0.0,
+      confirmed: false,
+      skipped: !(tierValue !== undefined || has),
+    }), true);
+    close();
+  });
+
+  const skipBtn = host.querySelector('[data-skip]');
+  if (skipBtn) skipBtn.addEventListener('click', () => {
+    save(name, Object.assign({}, answers[name], {
+      value: null, source: 'empty', confidence: 0.0, confirmed: false, skipped: true,
+    }), true);
+    close();
+  });
+
+  const first = scope.querySelector('input, textarea');
+  if (first) first.focus({ preventScroll: true });
+}
+
+function displayValue(name) {
+  const { field } = FIELDS[name];
+  const f = answers[name];
+  const v = f.value;
+  if (f.skipped && v == null) return '<span class="text-ink/35">Skipped</span>';
+  if (v == null || v === '') return '<span class="text-ink/35">Not answered</span>';
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+
+  if (Array.isArray(v)) {
+    if (!v.length) return '<span class="text-ink/35">None</span>';
+    if (field.item_schema) {
+      return v.map((row) => esc([row.drug, row.dosage, row.frequency, row.payment_method, row.pharmacy]
+        .filter(Boolean).join(' · '))).join('<br>');
+    }
+    return v.map(esc).join('<br>');
+  }
+  if (typeof v === 'object') {
+    return Object.entries(field.item_schema || {})
+      .filter(([k]) => v[k] != null)
+      .map(([k, spec]) => `${esc(spec.label)} ${money(v[k])}`).join('<br>')
+      || '<span class="text-ink/35">Not answered</span>';
+  }
+  if (field.value_type === 'currency') return money(v);
+  if (field.value_type === 'percent') return v + '%';
+  return esc(v);
+}
+
+/* ---------- inputs ---------- */
+
+function inputFor(name, field) {
+  const v = field.value;
+  const t = field.value_type;
+
+  if (field.choices && field.searchable) {
+    const shown = v != null && field.choices.indexOf(v) === -1 ? 'Other' : (v || '');
+    const other = v != null && field.choices.indexOf(v) === -1 ? v : '';
+    return `
+      <div data-role="combo-wrap" class="relative">
+        <input data-role="combo" role="combobox" aria-expanded="false" aria-autocomplete="list"
+          autocomplete="off" spellcheck="false" placeholder="Start typing to search…"
+          value="${esc(shown)}" class="${INPUT_CLS} pr-11">
+        <button type="button" data-role="combo-toggle" aria-label="Show all options" tabindex="-1"
+          class="absolute right-0 top-0 flex h-[56px] w-11 items-center justify-center text-ink/35">▾</button>
+        <ul data-role="combo-list" role="listbox"
+          class="absolute left-0 right-0 top-[60px] z-10 hidden max-h-64 overflow-y-auto rounded-xl border border-card bg-white py-1 shadow-xl"></ul>
+      </div>
+      <div data-role="other-wrap" class="${shown === 'Other' ? '' : 'hidden'} mt-4">
+        <label class="mb-1 block text-sm text-ink/70">Which one?</label>
+        <input data-role="other" value="${esc(other)}" placeholder="Type the name" class="${INPUT_CLS}">
+      </div>`;
+  }
+
+  if (field.choices) {
+    return `<div class="space-y-2">` + field.choices.map((c) => `
+      <button type="button" data-choice="${esc(c)}"
+        class="${CHOICE_CLS} ${v === c ? 'border-primary bg-primary text-white' : 'border-card bg-white text-ink'}">
+        ${esc(c)}
+      </button>`).join('') + `</div>`;
+  }
+
+  if (t === 'boolean') {
+    return `<div class="flex gap-2">` + [['Yes', true], ['No', false]].map(([l, val]) => `
+      <button type="button" data-choice='${esc(JSON.stringify(val))}' data-json="1"
+        class="min-h-[56px] flex-1 rounded-xl border px-3 text-base ${v === val && field.source !== 'empty' ? 'border-primary bg-primary text-white' : 'border-card bg-white text-ink'}">
+        ${esc(l)}
+      </button>`).join('') + `</div>`;
+  }
+
+  if (t === 'object' && field.item_schema) {
+    return `<div class="space-y-4">` + Object.entries(field.item_schema).map(([key, spec]) => `
+      <label class="block">
+        <span class="mb-1 block text-sm text-ink/70">${esc(spec.label)}</span>
+        <div class="relative">
+          <span class="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink/35">$</span>
+          <input data-sub="${esc(key)}" inputmode="decimal" value="${esc((v && v[key]) != null ? v[key] : '')}"
+            class="${INPUT_CLS} pl-8" placeholder="0">
+        </div>
+      </label>`).join('') + `</div>`;
+  }
+
+  if (t === 'list' && field.item_schema) {
+    const rows = Array.isArray(v) && v.length ? v : [{}];
+    return `
+      <div data-role="rows" class="space-y-4">${rows.map((row, i) => rxRow(field.item_schema, row, i)).join('')}</div>
+      <button type="button" data-role="add-row"
+        class="mt-4 min-h-[52px] w-full rounded-xl border-2 border-dashed border-card text-sm font-medium text-muted active:bg-bg">
+        + Add another
+      </button>`;
+  }
+
+  if (t === 'list') {
+    return `<textarea data-role="lines" rows="4" placeholder="One per line"
+      class="${INPUT_CLS} py-4">${esc(Array.isArray(v) ? v.join('\n') : '')}</textarea>`;
+  }
+
+  if (t === 'currency') {
+    return `<div class="relative">
+      <span class="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink/35">$</span>
+      <input data-role="value" inputmode="decimal" value="${esc(v != null ? v : '')}" class="${INPUT_CLS} pl-8" placeholder="0">
+    </div>`;
+  }
+  if (t === 'percent') {
+    return `<div class="relative">
+      <input data-role="value" inputmode="decimal" value="${esc(v != null ? v : '')}" class="${INPUT_CLS} pr-10" placeholder="20">
+      <span class="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-ink/35">%</span>
+    </div>`;
+  }
+
+  const attrs = {
+    email: 'type="email" inputmode="email" autocomplete="email" placeholder="you@example.com"',
+    zip: 'inputmode="numeric" autocomplete="postal-code" maxlength="10" placeholder="94110"',
+    integer: 'inputmode="numeric" placeholder="1"',
+  }[t] || `type="text" placeholder="${esc(field.placeholder || '')}"`;
+
+  return `<input data-role="value" ${attrs} value="${esc(v != null ? v : '')}" class="${INPUT_CLS}">`;
+}
+
+/* ---------- prescription autocomplete (NLM RxTerms) ---------- */
+
+const FREQUENCY_OPTIONS = [
+  'Once daily', 'Twice daily', 'Three times daily', 'Four times daily',
+  'Every other day', 'As needed', 'Weekly',
+];
+
+// Used whenever the RxTerms API is unreachable, slow, or errors -- the drug
+// field always stays a plain text input either way, this just keeps
+// suggestions (and a strength dropdown) available offline.
+const RX_FALLBACK_MEDS = [
+  { name: 'Metformin', strengths: ['500 mg Tab', '850 mg Tab', '1,000 mg Tab'] },
+  { name: 'Lisinopril', strengths: ['5 mg Tab', '10 mg Tab', '20 mg Tab', '40 mg Tab'] },
+  { name: 'Atorvastatin', strengths: ['10 mg Tab', '20 mg Tab', '40 mg Tab', '80 mg Tab'] },
+  { name: 'Levothyroxine', strengths: ['25 mcg Tab', '50 mcg Tab', '75 mcg Tab', '100 mcg Tab', '125 mcg Tab'] },
+  { name: 'Amlodipine', strengths: ['2.5 mg Tab', '5 mg Tab', '10 mg Tab'] },
+  { name: 'Metoprolol', strengths: ['25 mg Tab', '50 mg Tab', '100 mg Tab'] },
+  { name: 'Omeprazole', strengths: ['10 mg Cap', '20 mg Cap', '40 mg Cap'] },
+  { name: 'Losartan', strengths: ['25 mg Tab', '50 mg Tab', '100 mg Tab'] },
+  { name: 'Albuterol', strengths: ['90 mcg Inhaler', '2 mg/5 mL Syrup'] },
+  { name: 'Gabapentin', strengths: ['100 mg Cap', '300 mg Cap', '400 mg Cap', '600 mg Tab'] },
+  { name: 'Sertraline', strengths: ['25 mg Tab', '50 mg Tab', '100 mg Tab'] },
+  { name: 'Montelukast', strengths: ['4 mg Chewable Tab', '5 mg Chewable Tab', '10 mg Tab'] },
+  { name: 'Escitalopram', strengths: ['5 mg Tab', '10 mg Tab', '20 mg Tab'] },
+  { name: 'Rosuvastatin', strengths: ['5 mg Tab', '10 mg Tab', '20 mg Tab', '40 mg Tab'] },
+  { name: 'Bupropion', strengths: ['75 mg Tab', '100 mg Tab', '150 mg 24 HR XR Tab', '300 mg 24 HR XR Tab'] },
+  { name: 'Prednisone', strengths: ['1 mg Tab', '5 mg Tab', '10 mg Tab', '20 mg Tab'] },
+  { name: 'Ibuprofen', strengths: ['200 mg Tab', '400 mg Tab', '600 mg Tab', '800 mg Tab'] },
+  { name: 'Amoxicillin', strengths: ['250 mg Cap', '500 mg Cap', '875 mg Tab'] },
+  { name: 'Hydrochlorothiazide', strengths: ['12.5 mg Cap', '25 mg Tab', '50 mg Tab'] },
+  { name: 'Insulin glargine', strengths: ['100 unit/mL Pen Injector', '300 unit/mL Pen Injector'] },
+];
+
+const RX_DEBOUNCE_MS = 300;
+const RX_TIMEOUT_MS = 3000;
+
+function rxFallbackSearch(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  return RX_FALLBACK_MEDS.filter((m) => m.name.toLowerCase().indexOf(q) !== -1).slice(0, 8);
+}
+
+/* Never lets a network problem reach the caller as an error -- any failure,
+   non-2xx, timeout, or unexpected response shape falls back to the bundled
+   list so suggestions (and thus the strength dropdown) keep working, and the
+   drug field itself is a plain input regardless, so typing is never blocked. */
+async function rxSearchDrugs(query) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RX_TIMEOUT_MS);
+  try {
+    const url = 'https://clinicaltables.nlm.nih.gov/api/rxterms/v3/search?terms=' +
+      encodeURIComponent(query) + '&ef=STRENGTHS_AND_FORMS&maxList=8';
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error('rxterms http ' + res.status);
+    const data = await res.json();
+    const names = data && data[1];
+    const strengthLists = data && data[2] && data[2].STRENGTHS_AND_FORMS;
+    const display = data && data[3];
+    if (!Array.isArray(names)) throw new Error('unexpected rxterms response shape');
+    return names.map((fallbackName, i) => {
+      const shown = (Array.isArray(display) && Array.isArray(display[i]) && display[i][0]) || fallbackName;
+      const strengths = Array.isArray(strengthLists) && Array.isArray(strengthLists[i])
+        ? strengthLists[i].map((s) => String(s).trim()).filter(Boolean)
+        : [];
+      return { name: shown, strengths };
+    }).filter((d) => d.name);
+  } catch (err) {
+    return rxFallbackSearch(query);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function rxDosageInputHtml(value, placeholder) {
+  return `<input data-sub="dosage" placeholder="${esc(placeholder || 'Dosage / strength')}"
+    value="${esc(value || '')}" class="${INPUT_CLS}">`;
+}
+
+function rxDosageSelectHtml(strengths, selected, assumed) {
+  const [badgeText, badgeCls] = BADGES.assumed;
+  return `<select data-sub="dosage" data-assumed="${assumed ? '1' : '0'}" class="${INPUT_CLS}">
+      ${strengths.map((s) => `<option value="${esc(s)}" ${s === selected ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+    </select>
+    ${assumed ? `<p data-role="rx-dosage-assumed" class="mt-2">
+        <span class="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}">${esc(badgeText)}</span>
+      </p>` : ''}`;
+}
+
+function rxFrequencyHtml(value) {
+  return `<select data-sub="frequency" class="${INPUT_CLS}">
+    <option value="" ${!value ? 'selected' : ''}>How often do you take it?</option>
+    ${FREQUENCY_OPTIONS.map((opt) => `<option value="${esc(opt)}" ${value === opt ? 'selected' : ''}>${esc(opt)}</option>`).join('')}
+  </select>`;
+}
+
+const PAYMENT_METHODS = ['Through insurance', 'Paying cash'];
+
+/* Defaults to "Through insurance" and flags it assumed until the member taps
+   either option -- same "estimated, tap to correct" treatment as the
+   pre-picked strength, for the same reason (no per-list-item source in the
+   schema, so this is UI-only bookkeeping on the row). */
+function rxPaymentMethodHtml(value) {
+  const chosen = value || PAYMENT_METHODS[0];
+  const assumed = !value;
+  const [badgeText, badgeCls] = BADGES.assumed;
+  const btnCls = (active) => `min-h-[44px] flex-1 rounded-lg border px-3 text-sm font-medium ${
+    active ? 'border-primary bg-primary text-white' : 'border-card bg-white text-ink'}`;
+  return `
+    <div data-role="rx-payment-wrap">
+      <div class="flex gap-2">
+        ${PAYMENT_METHODS.map((opt) => `
+          <button type="button" data-payment-choice="${esc(opt)}" class="${btnCls(chosen === opt)}">
+            ${esc(opt)}
+          </button>`).join('')}
+      </div>
+      <input type="hidden" data-sub="payment_method" value="${esc(chosen)}">
+      ${assumed ? `<p data-role="rx-payment-assumed" class="mt-2">
+          <span class="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}">${esc(badgeText)}</span>
+        </p>` : ''}
+      <p class="mt-2 text-sm leading-relaxed text-muted">Cash prices are sometimes lower than your copay, so we check both.</p>
+    </div>`;
+}
+
+function wireRxPaymentField(i, scope) {
+  const wrap = scope.querySelector(`[data-rx="${i}"] [data-role="rx-payment-wrap"]`);
+  if (!wrap || wrap.dataset.rxWired === '1') return;
+  wrap.dataset.rxWired = '1';
+  const hidden = wrap.querySelector('input[data-sub="payment_method"]');
+  const buttons = wrap.querySelectorAll('[data-payment-choice]');
+  buttons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      hidden.value = btn.dataset.paymentChoice;
+      buttons.forEach((b) => {
+        b.className = `min-h-[44px] flex-1 rounded-lg border px-3 text-sm font-medium ${
+          b === btn ? 'border-primary bg-primary text-white' : 'border-card bg-white text-ink'}`;
+      });
+      const tag = wrap.querySelector('[data-role="rx-payment-assumed"]');
+      if (tag) tag.remove();
+    });
+  });
+}
+
+/* Swaps the dosage field to a pre-filled dropdown once a drug with known
+   strengths is picked. source="assumed" for that pre-selection is modeled
+   client-side (there's no per-list-item source in the schema) as the same
+   "estimated, tap to correct" badge used everywhere else -- it clears the
+   moment the member changes the dropdown themselves. */
+function applyRxStrengths(i, scope, strengths) {
+  const wrap = scope.querySelector(`[data-rx="${i}"] [data-role="rx-dosage-wrap"]`);
+  if (!wrap) return;
+  wrap.innerHTML = strengths.length
+    ? rxDosageSelectHtml(strengths, strengths[0], true)
+    : rxDosageInputHtml('', 'Dosage (e.g. 10 mg)');
+  wireRxDosageField(i, scope);
+}
+
+function wireRxDosageField(i, scope) {
+  const sel = scope.querySelector(`[data-rx="${i}"] select[data-sub="dosage"]`);
+  if (!sel || sel.dataset.rxWired === '1') return;
+  sel.dataset.rxWired = '1';
+  sel.addEventListener('change', () => {
+    sel.dataset.assumed = '0';
+    const tag = scope.querySelector(`[data-rx="${i}"] [data-role="rx-dosage-assumed"]`);
+    if (tag) tag.remove();
+  });
+}
+
+function wireRxDrugField(i, scope) {
+  const input = scope.querySelector(`[data-rx="${i}"] [data-role="rx-drug-input"]`);
+  const list = scope.querySelector(`[data-rx="${i}"] [data-role="rx-drug-list"]`);
+  if (!input || input.dataset.rxWired === '1') return;
+  input.dataset.rxWired = '1';
+
+  let debounceId = null;
+  let matches = [];
+  const closeList = () => { list.classList.add('hidden'); list.innerHTML = ''; };
+
+  input.addEventListener('input', () => {
+    closeList();
+    clearTimeout(debounceId);
+    const q = input.value.trim();
+    if (q.length < 3) return;
+    debounceId = setTimeout(async () => {
+      const found = await rxSearchDrugs(q);
+      if (input.value.trim() !== q) return;   // query changed while we were waiting
+      matches = found;
+      if (!matches.length) { closeList(); return; }
+      list.innerHTML = matches.map((m, idx) => `
+        <li data-idx="${idx}" class="flex min-h-[48px] cursor-pointer items-center px-4 text-base">
+          ${esc(m.name)}
+        </li>`).join('');
+      list.classList.remove('hidden');
+      list.querySelectorAll('[data-idx]').forEach((li) => {
+        li.addEventListener('mousedown', (e) => e.preventDefault());   // keep focus
+        li.addEventListener('click', () => {
+          const m = matches[Number(li.dataset.idx)];
+          input.value = m.name;
+          closeList();
+          applyRxStrengths(i, scope, m.strengths);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+      });
+    }, RX_DEBOUNCE_MS);
+  });
+  input.addEventListener('blur', () => setTimeout(closeList, 120));
+}
+
+function rxRow(itemSchema, row, i) {
+  return `<div class="space-y-2 rounded-xl bg-bg p-4" data-rx="${i}">
+    <div class="${LABEL_CLS}">Medication ${i + 1}</div>
+    <div class="relative">
+      <input data-role="rx-drug-input" data-sub="drug" autocomplete="off" spellcheck="false"
+        placeholder="${esc(itemSchema.drug.label)}" value="${esc(row.drug != null ? row.drug : '')}"
+        class="${INPUT_CLS}">
+      <ul data-role="rx-drug-list"
+        class="absolute left-0 right-0 top-[60px] z-10 hidden max-h-64 overflow-y-auto rounded-xl border border-card bg-white py-1 shadow-xl"></ul>
+    </div>
+    <div data-role="rx-dosage-wrap">${rxDosageInputHtml(row.dosage, itemSchema.dosage.label)}</div>
+    ${rxFrequencyHtml(row.frequency)}
+    ${rxPaymentMethodHtml(row.payment_method)}
+    <input data-sub="pharmacy" placeholder="${esc(itemSchema.pharmacy.label)}"
+      value="${esc(row.pharmacy != null ? row.pharmacy : '')}" class="${INPUT_CLS}">
+  </div>`;
+}
+
+function readValue(field, scope) {
+  const t = field.value_type;
+  const num = (el) => {
+    const raw = el.value.replace(/[^0-9.\-]/g, '');
+    return raw === '' ? null : Number(raw);
+  };
+
+  if (field.choices && field.searchable) {
+    const typed = scope.querySelector('[data-role="combo"]').value.trim();
+    const other = scope.querySelector('[data-role="other"]');
+    const match = field.choices.find((c) => c.toLowerCase() === typed.toLowerCase());
+    if (match === 'Other' || (!match && field.allow_other)) {
+      const free = other && other.value.trim();
+      return free || (match ? null : (typed || null));
+    }
+    return match || null;   // non-Other lists only accept a real option
+  }
+  if (t === 'object' && field.item_schema) {
+    const out = {};
+    scope.querySelectorAll('[data-sub]').forEach((el) => { out[el.dataset.sub] = num(el); });
+    return Object.values(out).some((x) => x != null) ? out : null;
+  }
+  if (t === 'list' && field.item_schema) {
+    const rows = [];
+    scope.querySelectorAll('[data-rx]').forEach((rowEl) => {
+      const row = {};
+      rowEl.querySelectorAll('[data-sub]').forEach((el) => { row[el.dataset.sub] = el.value.trim(); });
+      if (Object.values(row).some((x) => x)) rows.push(row);
+    });
+    return rows;
+  }
+  if (t === 'list') {
+    return scope.querySelector('[data-role="lines"]').value
+      .split('\n').map((s) => s.trim()).filter(Boolean);
+  }
+  const el = scope.querySelector('[data-role="value"]');
+  if (!el) return field.value;
+  if (t === 'currency' || t === 'percent' || t === 'integer') return num(el);
+  return el.value.trim() || null;
+}
+
+/* ---------- combobox ---------- */
+
+function comboOptions(field, query) {
+  const q = (query || '').trim().toLowerCase();
+  if (!q) return field.choices.slice();
+  const hits = field.choices.filter((c) => c.toLowerCase().indexOf(q) !== -1);
+  if (!hits.length && field.allow_other) return ['Other'];
+  return hits;
+}
+
+function drawCombo(field, query, scope) {
+  const list = scope.querySelector('[data-role="combo-list"]');
+  const input = scope.querySelector('[data-role="combo"]');
+  const opts = comboOptions(field, query);
+  if (comboHi >= opts.length) comboHi = opts.length - 1;
+
+  list.innerHTML = opts.length ? opts.map((c, i) => `
+    <li role="option" data-opt="${esc(c)}" aria-selected="${i === comboHi}"
+      class="flex min-h-[52px] cursor-pointer items-center px-4 text-base ${i === comboHi ? 'bg-bg' : ''} ${c === field.value ? 'font-semibold' : ''}">
+      ${esc(c)}
+    </li>`).join('')
+    : `<li class="px-4 py-3 text-sm text-ink/35">No matches</li>`;
+
+  list.classList.remove('hidden');
+  input.setAttribute('aria-expanded', 'true');
+  list.querySelectorAll('[data-opt]').forEach((li) => {
+    li.addEventListener('mousedown', (e) => e.preventDefault());  // keep focus
+    li.addEventListener('click', () => pickCombo(field, li.dataset.opt, scope));
+  });
+}
+
+function closeCombo(scope) {
+  const list = scope.querySelector('[data-role="combo-list"]');
+  const input = scope.querySelector('[data-role="combo"]');
+  if (list) list.classList.add('hidden');
+  if (input) input.setAttribute('aria-expanded', 'false');
+  comboHi = -1;
+}
+
+function pickCombo(field, choice, scope) {
+  const name = scope.closest('[data-row]').dataset.row;
+  const input = scope.querySelector('[data-role="combo"]');
+  const otherWrap = scope.querySelector('[data-role="other-wrap"]');
+  input.value = choice;
+  closeCombo(scope);
+
+  if (choice === 'Other' && field.allow_other) {
+    otherWrap.classList.remove('hidden');
+    otherWrap.querySelector('[data-role="other"]').focus();
+    return;
+  }
+  otherWrap.classList.add('hidden');
+  save(name, answered(name, choice), true);
+}
+
+function wire(name, field, scope, names) {
+  const combo = scope.querySelector('[data-role="combo"]');
+  if (combo) {
+    combo.addEventListener('focus', () => drawCombo(field, '', scope));
+    combo.addEventListener('input', () => { comboHi = -1; drawCombo(field, combo.value, scope); });
+    combo.addEventListener('blur', () => setTimeout(() => closeCombo(scope), 120));
+    scope.querySelector('[data-role="combo-toggle"]').addEventListener('click', () => {
+      const list = scope.querySelector('[data-role="combo-list"]');
+      list.classList.contains('hidden') ? (combo.focus(), drawCombo(field, '', scope)) : closeCombo(scope);
+    });
+    combo.addEventListener('keydown', (e) => {
+      const opts = comboOptions(field, combo.value);
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        comboHi = Math.max(0, Math.min(opts.length - 1, comboHi + (e.key === 'ArrowDown' ? 1 : -1)));
+        drawCombo(field, combo.value, scope);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const pick = comboHi >= 0 ? opts[comboHi] : (opts.length === 1 ? opts[0] : null);
+        if (pick) pickCombo(field, pick, scope);
+      } else if (e.key === 'Escape') closeCombo(scope);
+    });
+    const other = scope.querySelector('[data-role="other"]');
+    if (other) other.addEventListener('input', () => save(name, answered(name, other.value.trim() || null)));
+  }
+
+  scope.querySelectorAll('[data-choice]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const value = btn.dataset.json ? JSON.parse(btn.dataset.choice) : btn.dataset.choice;
+      save(name, answered(name, value), true);
+      openRow = null;
+      drawList(names);
+    });
+  });
+
+  scope.querySelectorAll('input, textarea').forEach((el) => {
+    if (el.dataset.role === 'combo' || el.dataset.role === 'other') return;
+    el.addEventListener('input', () => save(name, answered(name, readValue(field, scope))));
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && el.tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        scope.querySelector('[data-done]').click();
+      }
+    });
+  });
+
+  const add = scope.querySelector('[data-role="add-row"]');
+  if (add) add.addEventListener('click', () => {
+    const rows = readValue(field, scope);
+    rows.push({});
+    save(name, answered(name, rows));
+    scope.querySelector('[data-role="rows"]')
+      .insertAdjacentHTML('beforeend', rxRow(field.item_schema, {}, rows.length - 1));
+    wire(name, field, scope, names);
+  });
+
+  // Prescription rows only -- no-op (empty NodeList) for every other field.
+  scope.querySelectorAll('[data-rx]').forEach((rowEl) => {
+    const i = Number(rowEl.dataset.rx);
+    wireRxDrugField(i, scope);
+    wireRxDosageField(i, scope);
+    wireRxPaymentField(i, scope);
+  });
+}
+
+/* ---------- screen 4: confirmation ---------- */
+
+function renderConfirm() {
+  const t = tally();
+  const needsCheck = Object.keys(answers).filter((n) =>
+    !answers[n].confirmed && answers[n].source !== 'empty').length;
+
+  const groups = (SCHEMA.review_groups || []).map((g) => {
+    const rows = g.fields.filter((n) => FIELDS[n]);
+    if (!rows.length) return '';
+    return `
+      <section class="mt-6">
+        <h2 class="mb-2 ${LABEL_CLS}">${esc(g.title)}</h2>
+        <div class="divide-y divide-card overflow-hidden rounded-xl ring-1 ring-card">${rows.map(confirmRow).join('')}</div>
+      </section>`;
+  }).join('');
+
+  $('card').innerHTML = `
+    <h1 class="text-[28px] font-bold leading-tight tracking-tight text-ink">
+      Here's what we know about your plan.
+    </h1>
+    <p class="mt-4 text-base leading-relaxed text-ink/70">
+      ${needsCheck
+        ? `Nothing is submitted yet. ${needsCheck} ${needsCheck === 1 ? 'row still needs' : 'rows still need'} a
+           second look — fix anything that's off, then confirm below.`
+        : 'Nothing is submitted yet. Have a last look, then confirm below.'}
+    </p>
+    ${groups}`;
+
+  $('footer-actions').innerHTML = `
+    <button id="confirm-all" type="button" class="${BTN_PRIMARY}">Looks good, continue</button>
+    <button id="download" type="button" class="${BTN_SECOND}">Download my summary</button>
+    <button id="bk" type="button" class="w-full py-2 text-center ${LINK_CLS}">Back</button>`;
+
+  $('confirm-all').addEventListener('click', confirmAll);
+  $('download').addEventListener('click', downloadSummary);
+  $('bk').addEventListener('click', () => goto(3));
+
+  $('card').querySelectorAll('[data-edit]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.edit;
+      // Jump to whichever screen actually owns this field, with the row open.
+      const target = currentFieldNames(3).indexOf(name) !== -1 ? 3 : 2;
+      const card = $('card');
+      card.classList.add('leaving-back');
+      setTimeout(() => {
+        card.classList.remove('leaving-back');
+        screen = target;
+        render();
+        openRow = name;
+        drawList(currentFieldNames(target));
+        const row = card.querySelector(`[data-row="${name}"]`);
+        if (row) row.scrollIntoView({ block: 'center' });
+        card.classList.add('entering-back');
+        requestAnimationFrame(() => requestAnimationFrame(() =>
+          card.classList.remove('entering-back')));
+      }, 200);
+    });
+  });
+}
+
+function confirmRow(name) {
+  const { field } = FIELDS[name];
+  const f = answers[name];
+  const [badgeText, badgeCls] = BADGES[f.source] || ['not answered', 'bg-card/40 text-ink/45'];
+  const unconfirmed = !f.confirmed && f.source !== 'empty';
+
+  return `
+    <div class="p-6 ${unconfirmed ? 'bg-accent/10' : 'bg-white'}">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-xs text-ink/45">${esc(field.label)}</div>
+          <div class="mt-1 break-words text-base leading-snug text-ink">${displayValue(name)}</div>
+        </div>
+        <button type="button" data-edit="${esc(name)}"
+          class="-mr-1 -mt-1 shrink-0 rounded-lg px-3 py-2 text-sm font-medium text-muted underline underline-offset-2 active:bg-bg">
+          Edit
+        </button>
+      </div>
+      <div class="mt-2 flex flex-wrap items-center gap-2">
+        <span class="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${badgeCls}">${esc(badgeText)}</span>
+        ${unconfirmed ? `<span class="text-xs font-medium text-accent">Please double-check this</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function confirmAll() {
+  Object.keys(answers).forEach((name) => {
+    const f = answers[name];
+    if (f.source === 'empty' || f.confirmed) return;
+    save(name, Object.assign({}, f, { confirmed: true }));
+  });
+  flush();
+  submitFinal();
+
+  const card = $('card');
+  card.classList.add('leaving-fwd');
+  setTimeout(() => { card.classList.remove('leaving-fwd'); finished(); }, 200);
+}
+
+/* Rebuild the full schema shape from the working answers -- this is the JSON
+   Emme's cost engine reads. It's never handed to the member as a file; see
+   downloadSummary() below for what they actually get. */
+function buildExportPayload() {
+  const out = JSON.parse(JSON.stringify(SCHEMA));
+  out.session_id = window.sessionId || null;
+  out.generated_at = new Date().toISOString();
+  for (const stage of out.stages) {
+    for (const name of Object.keys(stage.fields)) {
+      const f = answers[name];
+      if (!f) continue;
+      Object.assign(stage.fields[name], {
+        value: f.value, source: f.source, confidence: f.confidence,
+        confirmed: f.confirmed, skipped: !!f.skipped,
+      });
+    }
+  }
+  return out;
+}
+
+/* Best-effort: the member's answers are already autosaved via /api/save, so
+   a failed submit here doesn't lose anything -- it just means the cost
+   engine won't have a snapshot until the next successful attempt. */
+async function submitFinal() {
+  if (!window.sessionId) return;
+  try {
+    await fetch('/api/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildExportPayload()),
+    });
+  } catch (err) { /* silent -- see comment above */ }
+}
+
+function finished() {
+  const t = tally();
+  $('card').innerHTML = `
+    <div class="rounded-xl bg-white p-6 text-center ring-1 ring-card">
+      <h1 class="text-[28px] font-bold leading-tight tracking-tight text-ink">That's everything.</h1>
+      <p class="mt-4 text-base leading-relaxed text-ink/70">
+        Your answers are saved. We'll read your plan against them and come back
+        with what it actually costs you.
+      </p>
+      ${t.assumed ? `<p class="mt-4 text-sm text-muted">${t.assumed}
+        ${t.assumed === 1 ? 'field is still an estimate' : 'fields are still estimates'} — open
+        <span class="font-medium text-ink/70">What we know</span> to correct them.</p>` : ''}
+      <p class="mt-4 break-all text-xs text-ink/35">Session ${esc(window.sessionId || '')}</p>
+    </div>`;
+  $('footer-actions').innerHTML = `
+    <button id="download-2" type="button" class="${BTN_SECOND}">Download my summary</button>`;
+  $('download-2').addEventListener('click', downloadSummary);
+  $('step-counter').textContent = 'Done';
+}
+
+/* The member-facing download: a one-page PDF rendered server-side from the
+   saved session. Flush first so it reflects whatever was just typed, not a
+   stale autosave. */
+async function downloadSummary() {
+  if (!window.sessionId) return;
+  await flush();
+  try {
+    const res = await fetch('/api/pdf/' + encodeURIComponent(window.sessionId));
+    if (!res.ok) throw new Error(res.status);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'emme-plan-summary.pdf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) { /* nothing to show the member -- the data is still saved server-side */ }
+}
+
+/* ---------- what we know so far ---------- */
+
+let lastEstimate = 0;
+
+function tally() {
+  let confirmed = 0, assumed = 0, extracted = 0, skipped = 0, remaining = 0;
+  for (const name of Object.keys(answers)) {
+    const f = answers[name];
+    if (f.source === 'assumed') assumed++;
+    else if (f.source === 'document') extracted++;
+    else if (f.skipped) skipped++;
+    else if (f.source !== 'empty' && f.value != null &&
+             !(Array.isArray(f.value) && !f.value.length)) confirmed++;
+    else remaining++;
+  }
+  return { confirmed, assumed, extracted, skipped, remaining,
+           total: Object.keys(answers).length };
+}
+
+/* A deliberately rough annual figure -- premiums plus what's left of the
+   deductible. It exists to make the panel feel alive, not to be quoted. */
+function roughEstimate() {
+  const num = (n) => (answers[n] && typeof answers[n].value === 'number' ? answers[n].value : null);
+  const premium = num('monthly_premium');
+  const ded = num('deductible_individual');
+  if (premium == null || ded == null) return null;
+  return premium * 12 + Math.max(0, ded - (num('deductible_met_ytd') || 0)) * 0.6;
+}
+
+function refreshPanel() {
+  if (!SCHEMA) return;
+  const t = tally();
+  const est = roughEstimate();
+  const assumedNames = Object.keys(answers).filter((n) => answers[n].source === 'assumed');
+
+  $('panel-body').innerHTML = `
+    <div class="grid grid-cols-2 gap-4">
+      <div class="rounded-xl bg-primary p-4 text-white">
+        <div class="text-3xl font-bold tabular-nums">${t.confirmed + t.extracted}</div>
+        <div class="mt-1 text-xs text-white/70">Confirmed${t.extracted ? ` · ${t.extracted} from documents` : ''}</div>
+      </div>
+      <div class="rounded-xl bg-white p-4 ring-1 ring-card">
+        <div class="text-3xl font-bold tabular-nums text-ink">${t.assumed}</div>
+        <div class="mt-1 text-xs text-muted">Estimated for you</div>
+      </div>
+    </div>
+
+    <p class="mt-4 text-xs leading-relaxed text-ink/45">
+      ${t.total - t.remaining} of ${t.total} filled in${t.skipped ? ` · ${t.skipped} skipped` : ''}.
+      ${t.assumed ? 'Anything estimated is worth correcting when you have your documents.' : ''}
+    </p>
+
+    <div class="mt-6 rounded-xl border p-4 ${est != null ? 'border-accent bg-accent/10' : 'border-dashed border-card bg-white'}">
+      <div class="${LABEL_CLS}">Your year, roughly</div>
+      ${est != null ? `
+        <div id="est-number" class="mt-1 text-3xl font-bold tabular-nums text-accent">${money(est)}</div>
+        <p class="mt-2 text-sm leading-relaxed text-muted">
+          Your estimate is ready once you finish — this is a running guess from
+          your premium and deductible so far.
+        </p>`
+      : `
+        <div class="mt-1 text-3xl font-bold tabular-nums text-ink/25">$——</div>
+        <p class="mt-2 text-sm leading-relaxed text-muted">
+          Your estimate is ready once you finish. Add your monthly premium and
+          deductible and this starts filling in.
+        </p>`}
+    </div>
+
+    ${assumedNames.length ? `
+      <div class="mt-6">
+        <div class="mb-2 ${LABEL_CLS}">Estimated fields</div>
+        <ul class="space-y-2">${assumedNames.map((n) => `
+          <li class="flex items-start justify-between gap-4 rounded-xl bg-white p-4 ring-1 ring-card">
+            <span class="text-sm text-ink/70">${esc(FIELDS[n].field.label)}</span>
+            <button type="button" data-goto="${esc(n)}"
+              class="shrink-0 text-xs font-medium text-muted underline underline-offset-2">Fix</button>
+          </li>`).join('')}</ul>
+      </div>` : ''}
+  `;
+
+  const el = $('est-number');
+  if (el && est != null && Math.round(est) !== Math.round(lastEstimate)) {
+    el.classList.add('tick');
+    el.addEventListener('animationend', () => el.classList.remove('tick'), { once: true });
+  }
+  if (est != null) lastEstimate = est;
+
+  $('panel-body').querySelectorAll('[data-goto]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.goto;
+      const target = currentFieldNames(3).indexOf(name) !== -1 ? 3 : 2;
+      closePanel();
+      screen = target;
+      render();
+      openRow = name;
+      drawList(currentFieldNames(target));
+      const row = $('card').querySelector(`[data-row="${name}"]`);
+      if (row) row.scrollIntoView({ block: 'center' });
+    });
+  });
+}
+
+function openPanel() {
+  refreshPanel();
+  $('panel').classList.remove('translate-x-full');
+  $('panel-scrim').classList.remove('opacity-0');
+  $('panel-scrim').classList.add('pointer-events-auto');
+  $('panel-close').focus();
+}
+function closePanel() {
+  $('panel').classList.add('translate-x-full');
+  $('panel-scrim').classList.add('opacity-0');
+  $('panel-scrim').classList.remove('pointer-events-auto');
+}
+$('panel-open').addEventListener('click', openPanel);
+$('panel-close').addEventListener('click', closePanel);
+$('panel-scrim').addEventListener('click', closePanel);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePanel(); });
+
+boot();
+</script>
+</body>
+</html>

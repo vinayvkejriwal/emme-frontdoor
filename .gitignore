@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+test-documents/
+*.pdf
+submissions/
+# Runtime data may contain a member's personal or health-plan information.
+sessions/
